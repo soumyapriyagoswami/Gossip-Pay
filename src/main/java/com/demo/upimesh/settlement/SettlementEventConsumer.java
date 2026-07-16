@@ -25,7 +25,10 @@ import java.time.Instant;
  * Pipeline per event:
  *   1. Idempotency claim (Redis) — duplicate bridge uploads of the same
  *      packet are dropped here, exactly once wins even with multiple
- *      consumer instances in the "settlement-service" group.
+ *      consumer instances in the "settlement-service" group. The claim
+ *      starts in PENDING and is only ever finalized to SETTLED once a
+ *      durable outcome exists; anything that goes wrong along the way
+ *      releases the claim (markFailed) instead of leaving it stuck.
  *   2. Decrypt + freshness + SIGNATURE VERIFICATION (PacketVerificationService).
  *   3. Debit/credit via the existing SettlementService (unchanged — still a
  *      single Postgres transaction with optimistic locking on Account).
@@ -51,40 +54,66 @@ public class SettlementEventConsumer {
     public void onPacketReceived(PacketReceivedEvent event) {
         String packetHash = event.packetHash();
 
-        if (!idempotency.claim(packetHash)) {
-            log.info("DUPLICATE packet {} — dropped by Settlement Service", shortHash(packetHash));
+        IdempotencyStore.ClaimResult claimResult = idempotency.claim(packetHash);
+        if (!claimResult.claimed()) {
+            log.info("DUPLICATE packet {} — dropped by Settlement Service (existing state={})",
+                    shortHash(packetHash), claimResult.existingState());
             return;
         }
 
-        PaymentInstruction instruction;
         try {
-            instruction = verification.verify(event.ciphertext());
-        } catch (PacketVerificationService.VerificationException e) {
-            log.warn("Packet {} failed verification: {}", shortHash(packetHash), e.reasonCode());
+            PaymentInstruction instruction;
+            try {
+                instruction = verification.verify(event.ciphertext());
+            } catch (PacketVerificationService.VerificationException e) {
+                log.warn("Packet {} failed verification: {}", shortHash(packetHash), e.reasonCode());
+                // Release rather than strand: a genuinely forged/tampered
+                // packet will simply fail verification again if redelivered,
+                // so there's no benefit to permanently blocking the hash —
+                // and a transient decrypt hiccup gets a fair retry.
+                idempotency.markFailed(packetHash);
+                kafkaTemplate.send(KafkaTopics.SETTLEMENT_DLQ, packetHash,
+                        new SettlementCompletedEvent(packetHash, null, null, null, null,
+                                "INVALID", e.reasonCode(), Instant.now().toEpochMilli()));
+                return;
+            }
+
+            Transaction tx = settlementService.settle(
+                    instruction, packetHash, event.bridgeNodeId(), event.hopCount());
+
+            // Durable outcome now exists (SETTLED or business-REJECTED) —
+            // finalize the claim so it can never be reprocessed.
+            idempotency.markSettled(packetHash);
+
+            SettlementCompletedEvent completed = new SettlementCompletedEvent(
+                    packetHash,
+                    tx.getId(),
+                    tx.getSenderVpa(),
+                    tx.getReceiverVpa(),
+                    tx.getAmount(),
+                    tx.getStatus().name(),
+                    tx.getStatus() == Transaction.Status.REJECTED ? "insufficient_balance" : null,
+                    Instant.now().toEpochMilli()
+            );
+
+            kafkaTemplate.send(KafkaTopics.SETTLEMENT_COMPLETED, packetHash, completed);
+            log.info("Settlement Service: {} packet {} ({} -> {}, ₹{}) -> published to {}",
+                    tx.getStatus(), shortHash(packetHash), tx.getSenderVpa(), tx.getReceiverVpa(),
+                    tx.getAmount(), KafkaTopics.SETTLEMENT_COMPLETED);
+
+        } catch (Exception e) {
+            // Unexpected failure (DB unavailable, optimistic lock exhausted,
+            // etc). Release the claim so the next delivery of this same
+            // packetHash — whether a Kafka redelivery or another bridge's
+            // copy of the same gossip packet — gets a genuine PENDING claim
+            // instead of being silently dropped as a false duplicate.
+            idempotency.markFailed(packetHash);
+            log.error("Settlement Service: unexpected error processing packet {}: {}",
+                    shortHash(packetHash), e.getMessage(), e);
             kafkaTemplate.send(KafkaTopics.SETTLEMENT_DLQ, packetHash,
                     new SettlementCompletedEvent(packetHash, null, null, null, null,
-                            "INVALID", e.reasonCode(), Instant.now().toEpochMilli()));
-            return;
+                            "ERROR", "internal_error: " + e.getMessage(), Instant.now().toEpochMilli()));
         }
-
-        Transaction tx = settlementService.settle(
-                instruction, packetHash, event.bridgeNodeId(), event.hopCount());
-
-        SettlementCompletedEvent completed = new SettlementCompletedEvent(
-                packetHash,
-                tx.getId(),
-                tx.getSenderVpa(),
-                tx.getReceiverVpa(),
-                tx.getAmount(),
-                tx.getStatus().name(),
-                tx.getStatus() == Transaction.Status.REJECTED ? "insufficient_balance" : null,
-                Instant.now().toEpochMilli()
-        );
-
-        kafkaTemplate.send(KafkaTopics.SETTLEMENT_COMPLETED, packetHash, completed);
-        log.info("Settlement Service: {} packet {} ({} -> {}, ₹{}) -> published to {}",
-                tx.getStatus(), shortHash(packetHash), tx.getSenderVpa(), tx.getReceiverVpa(),
-                tx.getAmount(), KafkaTopics.SETTLEMENT_COMPLETED);
     }
 
     private static String shortHash(String hash) {

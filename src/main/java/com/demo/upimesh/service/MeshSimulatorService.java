@@ -1,8 +1,10 @@
 package com.demo.upimesh.service;
 
+import com.demo.upimesh.mesh.RelayReceiptLedger;
 import com.demo.upimesh.model.MeshPacket;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
@@ -25,6 +27,11 @@ public class MeshSimulatorService {
     private static final Logger log = LoggerFactory.getLogger(MeshSimulatorService.class);
 
     private final Map<String, VirtualDevice> devices = new ConcurrentHashMap<>();
+
+    // Records + signs a relay receipt for every hop below, and is the basis
+    // for black-hole detection and device reputation scoring. Injected
+    // rather than constructed here so it stays a proper shared Spring bean.
+    @Autowired private RelayReceiptLedger relayReceipts;
 
     public MeshSimulatorService() {
         // Default scenario: 4 offline phones in a basement, 1 phone outside with 4G
@@ -90,6 +97,13 @@ public class MeshSimulatorService {
                     copy.setCreatedAt(pkt.getCreatedAt());
                     copy.setCiphertext(pkt.getCiphertext());
                     dst.hold(copy);
+
+                    // Mesh-layer security: src signs a receipt attesting it
+                    // handed this packet to dst. Later, detectBlackHoles()
+                    // cross-checks these to catch a node that took a packet
+                    // in and never relayed it further.
+                    relayReceipts.recordHop(pkt.getPacketId(), src.getDeviceId(), dst.getDeviceId(), copy.getTtl());
+
                     transfers++;
                 }
             }
@@ -124,6 +138,17 @@ public class MeshSimulatorService {
 
     public void resetMesh() {
         devices.values().forEach(VirtualDevice::clear);
+        relayReceipts.clear();
+    }
+
+    /** Device ids with internet connectivity — these upload to the backend
+     *  instead of relaying further, which black-hole detection needs to know. */
+    public Set<String> bridgeNodeIds() {
+        Set<String> ids = new HashSet<>();
+        for (VirtualDevice d : devices.values()) {
+            if (d.hasInternet()) ids.add(d.getDeviceId());
+        }
+        return ids;
     }
 
     public record GossipResult(int transfers, Map<String, Integer> deviceCounts) {}

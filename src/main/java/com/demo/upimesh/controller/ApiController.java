@@ -1,10 +1,15 @@
 package com.demo.upimesh.controller;
 
+import com.demo.upimesh.cache.IdempotencyReconciliationJob;
 import com.demo.upimesh.cache.IdempotencyStore;
 import com.demo.upimesh.crypto.DeviceKeyRegistry;
 import com.demo.upimesh.crypto.ServerKeyHolder;
 import com.demo.upimesh.gateway.PacketGatewayService;
 import com.demo.upimesh.ledger.LedgerRepository;
+import com.demo.upimesh.mesh.BlackHoleSuspicion;
+import com.demo.upimesh.mesh.DeviceReputationService;
+import com.demo.upimesh.mesh.RelayReceipt;
+import com.demo.upimesh.mesh.RelayReceiptLedger;
 import com.demo.upimesh.model.*;
 import com.demo.upimesh.notification.NotificationRepository;
 import com.demo.upimesh.service.*;
@@ -15,6 +20,7 @@ import org.springframework.web.bind.annotation.*;
 
 import java.math.BigDecimal;
 import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * Public REST surface.
@@ -42,6 +48,9 @@ public class ApiController {
     @Autowired private IdempotencyStore idempotency;
     @Autowired private LedgerRepository ledgerRepo;
     @Autowired private NotificationRepository notificationRepo;
+    @Autowired private RelayReceiptLedger relayReceipts;
+    @Autowired private DeviceReputationService reputation;
+    @Autowired private IdempotencyReconciliationJob reconciliationJob;
 
     // Only present when the "event-driven" profile is active.
     @Autowired(required = false) private PacketGatewayService gateway;
@@ -184,7 +193,66 @@ public class ApiController {
     public Map<String, Object> meshReset() {
         mesh.resetMesh();
         idempotency.clear();
-        return Map.of("status", "mesh and idempotency cache cleared");
+        return Map.of("status", "mesh, relay-receipt ledger, and idempotency cache cleared");
+    }
+
+    // ---------------------------------------------------- mesh-layer security
+
+    /** All signed relay receipts collected for one packet — the raw evidence
+     *  a sender (or the backend) would inspect to check for a black hole. */
+    @GetMapping("/mesh/relay-receipts/{packetId}")
+    public Map<String, Object> relayReceiptsForPacket(@PathVariable String packetId) {
+        List<RelayReceipt> receipts = relayReceipts.receiptsForPacket(packetId);
+        List<Map<String, Object>> data = receipts.stream().map(r -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("from", r.fromDeviceId());
+            m.put("to", r.toDeviceId());
+            m.put("ttlAfterHop", r.ttlAfterHop());
+            m.put("timestamp", r.timestampMillis());
+            m.put("signatureValid", relayReceipts.verify(r));
+            return m;
+        }).toList();
+        return Map.of("packetId", packetId, "hopCount", data.size(), "receipts", data);
+    }
+
+    /**
+     * Runs the black-hole detection sweep: any device that received a packet
+     * with hops left to give but produced no signed receipt showing it
+     * forwarded that packet onward. Each newly-detected suspicion also dings
+     * that device's reputation score (see /api/mesh/reputation).
+     */
+    @GetMapping("/mesh/black-holes")
+    public Map<String, Object> blackHoles() {
+        List<BlackHoleSuspicion> suspicions = relayReceipts.detectBlackHoles(mesh.bridgeNodeIds());
+        return Map.of("suspicionCount", suspicions.size(), "suspicions", suspicions);
+    }
+
+    /** Per-device trust scores derived from observed forwarding behavior. */
+    @GetMapping("/mesh/reputation")
+    public Object deviceReputation() {
+        return reputation.getAllReputations().stream()
+                .sorted(Comparator.comparingDouble(DeviceReputationService.Reputation::trustScore))
+                .collect(Collectors.toList());
+    }
+
+    // ------------------------------------------------------- idempotency ops
+
+    /**
+     * Operational view into the idempotency state machine: how many claims
+     * are currently PENDING (mid-flight or possibly stuck awaiting the
+     * reaper), plus the most recent drift report from the reconciliation
+     * job that cross-checks the cache against the `transactions` table.
+     */
+    @GetMapping("/idempotency/status")
+    public Map<String, Object> idempotencyStatus() {
+        IdempotencyReconciliationJob.Report report = reconciliationJob.getLastReport();
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("pendingClaimCount", idempotency.snapshotPending().size());
+        body.put("settledClaimCount", idempotency.snapshotSettled().size());
+        body.put("lastReconciliationRunAt", report.ranAt());
+        body.put("driftClaimedButNoTransaction", report.settledInCacheButNoTransaction());
+        body.put("driftTransactionButNoClaim", report.transactionButNoCacheEntry());
+        return body;
     }
 
     // -------------------------------------------------------------- bridge
