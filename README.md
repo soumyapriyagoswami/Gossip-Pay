@@ -15,7 +15,7 @@
 [![Kafka](https://img.shields.io/badge/Kafka-KRaft-231F20?style=for-the-badge&logo=apachekafka&logoColor=white)](https://kafka.apache.org)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://www.docker.com)
 [![CI/CD](https://img.shields.io/github/actions/workflow/status/soumyapriyagoswami/Gossip-Pay/cicd.yml?branch=main&style=for-the-badge&logo=githubactions&logoColor=white&label=CI%2FCD)](https://github.com/soumyapriyagoswami/Gossip-Pay/actions/workflows/cicd.yml/badge.svg)
-[![License](https://img.shields.io/badge/License-Demo%20%2F%20Learning-lightgrey?style=for-the-badge)](#license)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 <br/>
 
@@ -292,7 +292,7 @@ The cryptography, idempotency, and reliability engineering here are real and pro
 
 ## License
 
-Demo code, no license. Use it however you want for learning.
+Built with Innovation MIT license. Use it, Learn it, Contribute it.
 
 <div align="center">
 
