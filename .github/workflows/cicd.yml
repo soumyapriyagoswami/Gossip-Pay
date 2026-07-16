@@ -1,112 +1,19 @@
-name: Gossip&Pay CI/CD
+name: Java CI
 
 on:
   push:
-    branches: [ main, develop ]
   pull_request:
-    branches: [ main ]
 
 jobs:
-  build-and-test:
+  build:
     runs-on: ubuntu-latest
 
-    services:
-      # Optional: Run Postgres + Redis + Kafka only for event-driven tests
-      # Remove this section if you only want basic H2 tests
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_DB: gossippay
-          POSTGRES_USER: gossippay
-          POSTGRES_PASSWORD: gossippay
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-      kafka:
-        image: bitnami/kafka:3.7
-        ports:
-          - 9092:9092
-        env:
-          KAFKA_CFG_NODE_ID: 0
-          KAFKA_CFG_PROCESS_ROLES: controller,broker
-          KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
-          KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
-          KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
-          KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 0@kafka:9093
-          ALLOW_PLAINTEXT_LISTENER: "yes"
-        options: >-
-          --health-cmd "kafka-topics.sh --bootstrap-server localhost:9092 --list"
-          --health-interval 15s
-          --health-timeout 10s
-          --health-retries 5
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
-          java-version: '17'
-          distribution: 'temurin'
-          cache: 'maven'
+          distribution: temurin
+          java-version: 17
 
-      - name: Run Maven Build + Tests (Default Profile - H2)
-        run: ./mvnw clean verify -B -DskipTests=false
-
-      - name: Run Tests with Event-Driven Profile
-        run: |
-          ./mvnw test -Pevent-driven \
-            -Dspring.profiles.active=event-driven \
-            -DDB_HOST=localhost \
-            -DDB_PORT=5432 \
-            -DDB_NAME=gossippay \
-            -DDB_USER=gossippay \
-            -DDB_PASSWORD=gossippay \
-            -DREDIS_HOST=localhost \
-            -DREDIS_PORT=6379 \
-            -DKAFKA_BOOTSTRAP=localhost:9092
-
-      - name: Build JAR (for artifact)
-        run: ./mvnw package -DskipTests
-
-      - name: Upload Artifact (JAR)
-        uses: actions/upload-artifact@v4
-        with:
-          name: gossip-pay-jar
-          path: target/*.jar
-          retention-days: 7
-
-  # Optional: Simple CD (deploy to a server via SSH)
-  # Uncomment and configure if you have a VPS
-  # deploy:
-  #   needs: build-and-test
-  #   if: github.ref == 'refs/heads/main'
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/download-artifact@v4
-  #     - name: Deploy
-  #       uses: appleboy/ssh-action@v1.0.3
-  #       with:
-  #         host: ${{ secrets.SERVER_HOST }}
-  #         username: ${{ secrets.SERVER_USER }}
-  #         key: ${{ secrets.SSH_PRIVATE_KEY }}
-  #         script: |
-  #           pkill -f gossip-pay || true
-  #           mv gossip-pay-jar/*.jar /opt/gossip-pay/app.jar
-  #           nohup java -jar /opt/gossip-pay/app.jar --spring.profiles.active=event-driven > app.log 2>&1 &
+      - run: mvn clean verify
